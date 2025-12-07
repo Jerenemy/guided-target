@@ -19,7 +19,7 @@ cd "$REPO"
 python -m scripts.sample_for_pocket configs/sampling.yml \
    --pdb_path "$INPUT"/"$P53_NAME"_pocket10.pdb \
    --result_path "$OUTDIR" \
-   --num_samples 3000
+   --num_samples 1000
 
 
 
