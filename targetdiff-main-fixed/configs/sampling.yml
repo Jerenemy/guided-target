@@ -1,0 +1,15 @@
+model:
+  checkpoint: ./pretrained_models/pretrained_diffusion.pt
+
+sample:
+  seed: 66
+  num_samples: 100
+  num_steps: 1000
+  pos_only: False
+  center_pos_mode: protein
+  sample_num_atoms: prior
+
+  guidance_ckpt: "./pretrained_models/affinity_latest.pt"
+  guidance_scale: 2.0
+
+  use_guidance: true
