@@ -5,10 +5,17 @@ import torch.nn.functional as F
 from torch_geometric.utils import scatter
 import utils.transforms as trans  # for get_atomic_number_from_index
 
+LIGAND_NODE = 1
+POCKET_NODE = 0
+
+EDGE_LIGAND_LIGAND = 0
+EDGE_POCKET_TO_LIGAND = 1
+
 class GuidedAffinityWrapper(torch.nn.Module):
-    def __init__(self, affinity_model, pocket_pos, pocket_z=None, device='cpu', z_pocket_val=99):
+    def __init__(self, affinity_model, pocket_pos, pocket_z=None, device='cpu', z_pocket_val=99, ligand_atom_mode='add_aromatic'):
         super().__init__()
         self.affinity_model = affinity_model
+        self.ligand_atom_mode = ligand_atom_mode
         pocket_pos = pocket_pos.to(device)
         # keep pocket coordinates in the same centered frame as the sampler
         pocket_center = pocket_pos.mean(dim=0, keepdim=True)
@@ -28,7 +35,7 @@ class GuidedAffinityWrapper(torch.nn.Module):
 
         # 1) map TargetDiff index -> atomic number using your transforms
         atomic_numbers = trans.get_atomic_number_from_index(
-            ligand_v.detach().cpu(), mode='add_aromatic'
+            ligand_v.detach().cpu(), mode=self.ligand_atom_mode
         )  # returns list of ints
         z_lig = torch.tensor(atomic_numbers, dtype=torch.long, device=device)  # [N_lig]
 
@@ -60,6 +67,268 @@ class GuidedAffinityWrapper(torch.nn.Module):
 
         affinity = self.affinity_model(data)  # [B]
         # better binder = more negative Vina, so maximize -affinity
+        return -affinity
+
+
+def extract_guidance_state_dict(ckpt_or_state):
+    if isinstance(ckpt_or_state, dict) and "model" in ckpt_or_state:
+        return ckpt_or_state["model"]
+    return ckpt_or_state
+
+
+def infer_guidance_architecture(state_dict):
+    keys = set(state_dict.keys())
+    if "node_type_emb.weight" in keys and any(k.endswith("rbf.centers") for k in keys):
+        return "ligand_context"
+    if any("tp_msg" in k for k in keys):
+        return "equivariant"
+    raise ValueError("Could not infer guidance architecture from checkpoint state_dict")
+
+
+def infer_ligand_context_model_kwargs(state_dict):
+    layer_ids = sorted({
+        int(k.split(".")[1])
+        for k in state_dict.keys()
+        if k.startswith("layers.") and len(k.split(".")) > 2 and k.split(".")[1].isdigit()
+    })
+    n_layers = len(layer_ids)
+    hidden = state_dict["z_emb.weight"].shape[1]
+    num_rbf = state_dict["layers.0.rbf.centers"].numel()
+    cutoff = float(state_dict["layers.0.rbf.centers"][-1].item()) if num_rbf > 0 else 6.0
+    return {
+        "max_z": state_dict["z_emb.weight"].shape[0],
+        "hidden": hidden,
+        "n_layers": n_layers,
+        "num_rbf": num_rbf,
+        "cutoff": cutoff,
+        # Dropout does not affect eval-mode inference; keep runtime default aligned with training notebook.
+        "dropout": 0.1,
+    }
+
+
+def build_context_edges(pos, node_type, batch=None, r_ligand=5.0, r_cross=6.0):
+    """
+    Runtime-compatible directed context graph:
+      - ligand -> ligand spatial edges within r_ligand
+      - pocket -> ligand context edges within r_cross
+    Pocket nodes act as context sources and are not updated by default.
+    """
+    if batch is None:
+        batch = torch.zeros(pos.size(0), dtype=torch.long, device=pos.device)
+
+    edge_src = []
+    edge_dst = []
+    edge_type = []
+
+    for b in batch.unique():
+        mask_b = batch == b
+        idx = mask_b.nonzero(as_tuple=True)[0]
+        if idx.numel() == 0:
+            continue
+
+        sub_pos = pos[idx]
+        sub_type = node_type[idx]
+
+        lig_local = (sub_type == LIGAND_NODE).nonzero(as_tuple=True)[0]
+        poc_local = (sub_type == POCKET_NODE).nonzero(as_tuple=True)[0]
+
+        if lig_local.numel() > 0:
+            lig_pos = sub_pos[lig_local]
+            dist_ll = torch.cdist(lig_pos, lig_pos, p=2)
+            keep_ll = dist_ll <= r_ligand
+            keep_ll = keep_ll & ~torch.eye(lig_local.numel(), dtype=torch.bool, device=pos.device)
+            src_ll, dst_ll = keep_ll.nonzero(as_tuple=True)
+            if src_ll.numel() > 0:
+                edge_src.append(idx[lig_local[src_ll]])
+                edge_dst.append(idx[lig_local[dst_ll]])
+                edge_type.append(torch.full((src_ll.numel(),), EDGE_LIGAND_LIGAND, dtype=torch.long, device=pos.device))
+
+        if lig_local.numel() > 0 and poc_local.numel() > 0:
+            lig_pos = sub_pos[lig_local]
+            poc_pos = sub_pos[poc_local]
+            dist_pl = torch.cdist(poc_pos, lig_pos, p=2)
+            keep_pl = dist_pl <= r_cross
+            src_pl, dst_pl = keep_pl.nonzero(as_tuple=True)
+            if src_pl.numel() > 0:
+                edge_src.append(idx[poc_local[src_pl]])
+                edge_dst.append(idx[lig_local[dst_pl]])
+                edge_type.append(torch.full((src_pl.numel(),), EDGE_POCKET_TO_LIGAND, dtype=torch.long, device=pos.device))
+
+    if len(edge_src) == 0:
+        return (
+            torch.empty(2, 0, dtype=torch.long, device=pos.device),
+            torch.empty(0, dtype=torch.long, device=pos.device),
+        )
+
+    edge_index = torch.stack([torch.cat(edge_src), torch.cat(edge_dst)], dim=0)
+    edge_type = torch.cat(edge_type, dim=0)
+    return edge_index, edge_type
+
+
+class GaussianRBF(nn.Module):
+    def __init__(self, num_rbf=32, cutoff=6.0):
+        super().__init__()
+        centers = torch.linspace(0.0, cutoff, num_rbf)
+        self.register_buffer("centers", centers)
+        self.gamma = 1.0 / max((centers[1] - centers[0]).item() ** 2, 1e-6) if num_rbf > 1 else 1.0
+
+    def forward(self, dist):
+        diff = dist.unsqueeze(-1) - self.centers.unsqueeze(0)
+        return torch.exp(-self.gamma * diff.pow(2))
+
+
+class ContextMessageBlock(nn.Module):
+    def __init__(self, hidden, num_edge_types=2, num_rbf=32, cutoff=6.0, dropout=0.1):
+        super().__init__()
+        self.rbf = GaussianRBF(num_rbf=num_rbf, cutoff=cutoff)
+        self.edge_type_emb = nn.Embedding(num_edge_types, hidden)
+        self.msg_mlp = nn.Sequential(
+            nn.Linear(2 * hidden + hidden + num_rbf, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+        )
+        self.upd_mlp = nn.Sequential(
+            nn.Linear(2 * hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+        )
+        self.norm = nn.LayerNorm(hidden)
+
+    def forward(self, h, pos, edge_index, edge_type, node_type):
+        if edge_index.numel() == 0:
+            return h
+
+        src, dst = edge_index
+        rel = pos[src] - pos[dst]
+        dist = rel.norm(dim=-1)
+        radial = self.rbf(dist)
+        edge_kind = self.edge_type_emb(edge_type)
+
+        m_in = torch.cat([h[src], h[dst], edge_kind, radial], dim=-1)
+        m_ij = self.msg_mlp(m_in)
+        m_i = scatter(m_ij, dst, dim=0, dim_size=h.size(0), reduce="mean")
+
+        upd = self.upd_mlp(torch.cat([h, m_i], dim=-1))
+        lig_mask = node_type == LIGAND_NODE
+        out = h.clone()
+        out[lig_mask] = self.norm(h[lig_mask] + upd[lig_mask])
+        return out
+
+
+class LigandContextAffinityModel(nn.Module):
+    def __init__(self, max_z=100, hidden=128, n_layers=4, num_rbf=32, cutoff=6.0, dropout=0.1):
+        super().__init__()
+        self.z_emb = nn.Embedding(max_z, hidden)
+        self.node_type_emb = nn.Embedding(2, hidden)
+        self.input_norm = nn.LayerNorm(hidden)
+        self.layers = nn.ModuleList([
+            ContextMessageBlock(hidden=hidden, num_edge_types=2, num_rbf=num_rbf, cutoff=cutoff, dropout=dropout)
+            for _ in range(n_layers)
+        ])
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, data):
+        pos = data.pos
+        z = data.z
+        node_type = data.node_type.long()
+        edge_index = data.edge_index
+        edge_type = data.edge_type.long()
+
+        batch = getattr(data, "batch", None)
+        if batch is None:
+            batch = torch.zeros(pos.size(0), dtype=torch.long, device=pos.device)
+
+        h = self.z_emb(z) + self.node_type_emb(node_type)
+        h = self.input_norm(h)
+
+        for layer in self.layers:
+            h = layer(h, pos, edge_index, edge_type, node_type)
+
+        lig_mask = (node_type == LIGAND_NODE).float()
+        lig_counts = scatter(lig_mask, batch, dim=0, reduce="sum").clamp(min=1.0)
+        g = scatter(h * lig_mask.unsqueeze(-1), batch, dim=0, reduce="sum")
+        g = g / lig_counts.unsqueeze(-1)
+        affinity = self.head(g).squeeze(-1)
+        return affinity
+
+
+class GuidedLigandContextWrapper(nn.Module):
+    def __init__(
+        self,
+        affinity_model,
+        pocket_pos,
+        pocket_z,
+        ligand_atom_mode='add_aromatic',
+        r_ligand=5.0,
+        r_cross=6.0,
+        device='cpu',
+    ):
+        super().__init__()
+        self.affinity_model = affinity_model
+        self.ligand_atom_mode = ligand_atom_mode
+        self.r_ligand = r_ligand
+        self.r_cross = r_cross
+
+        pocket_pos = pocket_pos.to(device)
+        pocket_center = pocket_pos.mean(dim=0, keepdim=True)
+        self.register_buffer("pocket_pos_centered", pocket_pos - pocket_center)
+        self.register_buffer("pocket_z", pocket_z.to(device).long())
+        self.num_pocket_atoms = pocket_pos.size(0)
+
+    def forward(self, ligand_pos, ligand_v, batch_ligand, batch_protein, protein_pos=None):
+        device = ligand_pos.device
+        num_graphs = batch_ligand.max().item() + 1
+
+        atomic_numbers = trans.get_atomic_number_from_index(
+            ligand_v.detach().cpu(), mode=self.ligand_atom_mode
+        )
+        z_lig = torch.tensor(atomic_numbers, dtype=torch.long, device=device)
+
+        use_provided_protein = (
+            protein_pos is not None
+            and batch_protein is not None
+            and protein_pos.size(0) == self.num_pocket_atoms * num_graphs
+        )
+        if use_provided_protein:
+            pocket_pos = protein_pos
+            pocket_batch = batch_protein
+        else:
+            pocket_pos = self.pocket_pos_centered.repeat(num_graphs, 1)
+            pocket_batch = torch.arange(num_graphs, device=device).repeat_interleave(self.num_pocket_atoms)
+
+        z_pocket = self.pocket_z.repeat(num_graphs).to(device)
+
+        pos = torch.cat([ligand_pos, pocket_pos], dim=0)
+        z = torch.cat([z_lig, z_pocket], dim=0)
+        batch = torch.cat([batch_ligand, pocket_batch], dim=0)
+        node_type = torch.cat([
+            torch.ones(ligand_pos.size(0), dtype=torch.long, device=device),
+            torch.zeros(pocket_pos.size(0), dtype=torch.long, device=device),
+        ])
+        edge_index, edge_type = build_context_edges(
+            pos=pos,
+            node_type=node_type,
+            batch=batch,
+            r_ligand=self.r_ligand,
+            r_cross=self.r_cross,
+        )
+
+        data = Data(
+            pos=pos,
+            z=z,
+            batch=batch,
+            node_type=node_type,
+            edge_index=edge_index,
+            edge_type=edge_type,
+        )
+        affinity = self.affinity_model(data)
         return -affinity
 
 from e3nn import o3

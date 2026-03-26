@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_scatter import scatter_sum, scatter_mean
 from tqdm.auto import tqdm
+import numbers
 
 from models.common import compose_context, ShiftedSoftplus
 from models.egnn import EGNN
@@ -649,10 +650,25 @@ class ScorePosNet3D(nn.Module):
         pos_only=False,
         guidance_model=None, # guidance
         guidance_scale: float = 0.0, # guidance
+        guidance_start_step=None,  # optional: only apply guidance when t <= this (int or fraction in (0,1))
+        guidance_log: bool = False,
+        guidance_record_stats: bool = False,
+        guidance_scale_mode: str = "var",  # 'var' (default, sigma^2), 'sigma', or 'fixed' (no sigma factor)
+        noise_scale: float = 1.0,  # multiply diffusion noise by this factor (e.g., <1 to let guidance dominate)
     ):
         if num_steps is None:
             num_steps = self.num_timesteps
         num_graphs = batch_protein.max().item() + 1
+
+        # interpret fractional start step
+        guidance_start_idx = None
+        if guidance_start_step is not None:
+            # allow ints or any real number
+            if isinstance(guidance_start_step, numbers.Real) and 0 < guidance_start_step < 1:
+                # fraction of the executed window [T-num_steps, T)
+                guidance_start_idx = (self.num_timesteps - num_steps) + int(guidance_start_step * num_steps)
+            else:
+                guidance_start_idx = int(guidance_start_step)
 
         protein_pos, init_ligand_pos, offset = center_pos(
             protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode)
@@ -660,6 +676,7 @@ class ScorePosNet3D(nn.Module):
         pos_traj, v_traj = [], []
         v0_pred_traj, vt_pred_traj = [], []
         ligand_pos, ligand_v = init_ligand_pos, init_ligand_v
+        guidance_stats = []
         # time sequence
         time_seq = list(reversed(range(self.num_timesteps - num_steps, self.num_timesteps)))
         for i in tqdm(time_seq, desc='sampling', total=len(time_seq)):
@@ -699,7 +716,8 @@ class ScorePosNet3D(nn.Module):
             sigma = (0.5 * pos_log_variance).exp()
             nonzero_mask = (1 - (t == 0).float())[batch_ligand].unsqueeze(-1)
 
-            if guidance_model is not None and guidance_scale > 0:
+            guidance_active = guidance_model is not None and guidance_scale > 0
+            if guidance_active and (guidance_start_idx is None or i <= guidance_start_idx):
                 with torch.enable_grad():
                     lig_pos_leaf = ligand_pos.detach().clone().requires_grad_(True)
                     # scalar score per complex; e.g. -Vina_energy
@@ -710,6 +728,7 @@ class ScorePosNet3D(nn.Module):
                         batch_protein=batch_protein,
                         protein_pos=protein_pos,    # optional, if your wrapper uses it
                     )
+                    score_mean = score.detach().mean().item()
                     J = score.sum()
                     grad = torch.autograd.grad(J, lig_pos_leaf)[0]   # ∇_{x_t} J
 
@@ -718,13 +737,46 @@ class ScorePosNet3D(nn.Module):
                     grad = grad - grad_mean[batch_ligand]
 
                 var = sigma ** 2
+                if guidance_scale_mode == "var":
+                    guidance_delta = guidance_scale * var * grad
+                elif guidance_scale_mode == "sigma":
+                    guidance_delta = guidance_scale * sigma * grad
+                elif guidance_scale_mode == "fixed":
+                    guidance_delta = guidance_scale * grad
+                else:
+                    raise ValueError(f"Unknown guidance_scale_mode {guidance_scale_mode}")
+
                 noise = torch.randn_like(ligand_pos)
-                ligand_pos_next = pos_model_mean \
-                                + guidance_scale * var * grad \
-                                + nonzero_mask * sigma * noise
+                noise_term = nonzero_mask * (sigma * noise_scale) * noise
+                ligand_pos_next = pos_model_mean + guidance_delta + noise_term
+
+                if guidance_log or guidance_record_stats:
+                    grad_norm = grad.norm(dim=1).mean().item()
+                    guidance_term = guidance_delta.norm(dim=1).mean().item()
+                    noise_term_norm = noise_term.norm(dim=1).mean().item()
+                    ratio = guidance_term / (noise_term_norm + 1e-8)
+                    guidance_stats.append({
+                        't': int(i),
+                        'grad_norm_mean': grad_norm,
+                        'guidance_term_norm_mean': guidance_term,
+                        'noise_term_norm_mean': noise_term_norm,
+                        'guidance_over_noise': ratio,
+                        'sigma_mean': sigma.mean().item(),
+                        'guidance_scale_mode': guidance_scale_mode,
+                        'noise_scale': noise_scale,
+                        'score_mean': score_mean,
+                    })
+                    if guidance_log and len(guidance_stats) % max(1, num_steps // 10) == 0:
+                        print(
+                            f"[guidance] t={i} grad_norm={grad_norm:.4f} "
+                            f"guidance_term={guidance_term:.4f} noise_term={noise_term_norm:.4f} "
+                            f"ratio={ratio:.4f} sigma={sigma.mean().item():.4f} "
+                            f"mode={guidance_scale_mode} noise_scale={noise_scale} "
+                            f"score_mean={score_mean:.4f}"
+                        )
             else:
                 noise = torch.randn_like(ligand_pos)
-                ligand_pos_next = pos_model_mean + nonzero_mask * sigma * noise
+                ligand_pos_next = pos_model_mean + nonzero_mask * (sigma * noise_scale) * noise
 
             ligand_pos = ligand_pos_next
             ######## guidance ##############
@@ -750,7 +802,8 @@ class ScorePosNet3D(nn.Module):
             'pos_traj': pos_traj,
             'v_traj': v_traj,
             'v0_traj': v0_pred_traj,
-            'vt_traj': vt_pred_traj
+            'vt_traj': vt_pred_traj,
+            'guidance_stats': guidance_stats if (guidance_log or guidance_record_stats) else None,
         }
 
 

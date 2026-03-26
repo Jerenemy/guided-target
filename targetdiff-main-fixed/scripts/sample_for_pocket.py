@@ -14,7 +14,15 @@ from utils.data import PDBProtein
 from utils import reconstruct
 from rdkit import Chem
 
-from models.guidance import GuidedAffinityWrapper, EquivariantAffinityModel
+from models.guidance import (
+    EquivariantAffinityModel,
+    GuidedAffinityWrapper,
+    GuidedLigandContextWrapper,
+    LigandContextAffinityModel,
+    extract_guidance_state_dict,
+    infer_guidance_architecture,
+    infer_ligand_context_model_kwargs,
+)
 
 
 def pdb_to_pocket_data(pdb_path):
@@ -81,23 +89,53 @@ if __name__ == '__main__':
     # build guidance model if enabled
     guidance_model = None
     if getattr(config.sample, "use_guidance", False):
-        # 1) instantiate affinity model
-        aff_model = EquivariantAffinityModel(max_z=100).to(args.device)
         ckpt_aff = torch.load(config.sample.guidance_ckpt, map_location=args.device)
-        aff_model.load_state_dict(ckpt_aff["model"])
+        state_aff = extract_guidance_state_dict(ckpt_aff)
+        guidance_arch = getattr(config.sample, "guidance_arch", "auto")
+        if guidance_arch in (None, "auto"):
+            guidance_arch = infer_guidance_architecture(state_aff)
+
+        if guidance_arch == "equivariant":
+            aff_model = EquivariantAffinityModel(max_z=100).to(args.device)
+            aff_model.load_state_dict(state_aff)
+            wrapper_cls = GuidedAffinityWrapper
+            wrapper_kwargs = {
+                "ligand_atom_mode": ligand_atom_mode,
+            }
+        elif guidance_arch == "ligand_context":
+            model_kwargs = infer_ligand_context_model_kwargs(state_aff)
+            aff_model = LigandContextAffinityModel(**model_kwargs).to(args.device)
+            aff_model.load_state_dict(state_aff)
+            wrapper_cls = GuidedLigandContextWrapper
+            wrapper_kwargs = {
+                "ligand_atom_mode": ligand_atom_mode,
+                "r_ligand": getattr(config.sample, "guidance_ligand_radius", 5.0),
+                "r_cross": getattr(config.sample, "guidance_cross_radius", 6.0),
+            }
+        else:
+            raise ValueError(f"Unknown guidance_arch {guidance_arch}")
+
         aff_model.eval()
+        logger.info(f"Using guidance architecture: {guidance_arch}")
 
         # 2) wrap it with pocket info
         pocket_pos = data.protein_pos.to(args.device)  # this is your pocket from PDB
-        guidance_model = GuidedAffinityWrapper(
+        guidance_model = wrapper_cls(
             affinity_model=aff_model,
             pocket_pos=pocket_pos,
             pocket_z=data.protein_element,
             device=args.device,
+            **wrapper_kwargs,
         )
     #################################### guidance #############################
     
-    all_pred_pos, all_pred_v, pred_pos_traj, pred_v_traj, pred_v0_traj, pred_vt_traj, time_list = sample_diffusion_ligand(
+    guidance_return_stats = getattr(config.sample, "guidance_log_stats", False)
+    guidance_start_step = getattr(config.sample, "guidance_start_step", None)
+    guidance_log = guidance_return_stats or getattr(config.sample, "guidance_log", False)
+    guidance_scale_mode = getattr(config.sample, "guidance_scale_mode", "var")
+    noise_scale = getattr(config.sample, "noise_scale", 1.0)
+
+    sample_outputs = sample_diffusion_ligand(
         model, data, config.sample.num_samples,
         batch_size=args.batch_size, device=args.device,
         num_steps=config.sample.num_steps,
@@ -106,7 +144,16 @@ if __name__ == '__main__':
         sample_num_atoms=config.sample.sample_num_atoms,
         guidance_model=guidance_model,
         guidance_scale=getattr(config.sample, "guidance_scale", 0.0),
+        guidance_start_step=guidance_start_step,
+        guidance_log=guidance_log,
+        guidance_return_stats=guidance_return_stats,
+        guidance_scale_mode=guidance_scale_mode,
+        noise_scale=noise_scale,
     )
+    if guidance_return_stats:
+        (all_pred_pos, all_pred_v, pred_pos_traj, pred_v_traj, pred_v0_traj, pred_vt_traj, time_list, guidance_stats) = sample_outputs
+    else:
+        (all_pred_pos, all_pred_v, pred_pos_traj, pred_v_traj, pred_v0_traj, pred_vt_traj, time_list) = sample_outputs
     result = {
         'data': data,
         'pred_ligand_pos': all_pred_pos,
@@ -114,15 +161,17 @@ if __name__ == '__main__':
         'pred_ligand_pos_traj': pred_pos_traj,
         'pred_ligand_v_traj': pred_v_traj
     }
+    if guidance_return_stats:
+        result['guidance_stats'] = guidance_stats
     logger.info('Sample done!')
 
     # reconstruction
     gen_mols = []
     n_recon_success, n_complete = 0, 0
     for sample_idx, (pred_pos, pred_v) in enumerate(zip(all_pred_pos, all_pred_v)):
-        pred_atom_type = trans.get_atomic_number_from_index(pred_v, mode='add_aromatic')
+        pred_atom_type = trans.get_atomic_number_from_index(pred_v, mode=ligand_atom_mode)
         try:
-            pred_aromatic = trans.is_aromatic_from_index(pred_v, mode='add_aromatic')
+            pred_aromatic = trans.is_aromatic_from_index(pred_v, mode=ligand_atom_mode)
             mol = reconstruct.reconstruct_from_generated(pred_pos, pred_atom_type, pred_aromatic)
             smiles = Chem.MolToSmiles(mol)
         except reconstruct.MolReconsError:
@@ -143,6 +192,13 @@ if __name__ == '__main__':
     os.makedirs(result_path, exist_ok=True)
     shutil.copyfile(args.config, os.path.join(result_path, 'sample.yml'))
     torch.save(result, os.path.join(result_path, f'sample.pt'))
+    # optional: dump guidance stats for post-hoc inspection
+    if guidance_return_stats and guidance_stats:
+        import json
+        stats_path = os.path.join(result_path, "guidance_stats.json")
+        with open(stats_path, "w") as f:
+            json.dump(guidance_stats, f, indent=2)
+        logger.info(f"Saved guidance stats to {stats_path}")
     mols_save_path = os.path.join(result_path, f'sdf')
     os.makedirs(mols_save_path, exist_ok=True)
     for idx, mol in enumerate(gen_mols):

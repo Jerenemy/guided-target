@@ -9,7 +9,20 @@ sample:
   center_pos_mode: protein
   sample_num_atoms: prior
 
-  guidance_ckpt: "./pretrained_models/affinity_latest.pt"
-  guidance_scale: 2.0
+  guidance_ckpt: "./pretrained_models/ligand_context_score_only.pt"
+  guidance_arch: auto
+  guidance_ligand_radius: 5.0
+  guidance_cross_radius: 6.0
+  guidance_scale: 0.1
+  # Only apply guidance when timestep <= guidance_start_step.
+  # If set to a float in (0,1), treated as fraction of total steps.
+  # Leave unset/null to apply at all steps (default).
+  guidance_start_step: 0.1
+  # How to scale guidance: 'var' (sigma^2 * grad), 'sigma' (sigma * grad), 'fixed' (grad only)
+  guidance_scale_mode: sigma
+  # Multiply diffusion noise by this factor (e.g., <1 to let guidance dominate)
+  noise_scale: 1.0
+  # Log and store per-step guidance stats (grad norms, guidance/noise magnitudes)
+  guidance_log_stats: true
 
   use_guidance: true

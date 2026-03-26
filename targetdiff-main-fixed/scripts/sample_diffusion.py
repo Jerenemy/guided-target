@@ -30,11 +30,14 @@ def unbatch_v_traj(ligand_v_traj, n_data, ligand_cum_atoms):
 
 def sample_diffusion_ligand(model, data, num_samples, batch_size=16, device='cuda:0',
                             num_steps=None, pos_only=False, center_pos_mode='protein',
-                            sample_num_atoms='prior', guidance_model=None, guidance_scale: float = 0.0): # added guidance params
+                            sample_num_atoms='prior', guidance_model=None, guidance_scale: float = 0.0,
+                            guidance_start_step=None, guidance_log: bool = False, guidance_return_stats: bool = False,
+                            guidance_scale_mode: str = "var", noise_scale: float = 1.0): # added guidance params
     all_pred_pos, all_pred_v = [], []
     all_pred_pos_traj, all_pred_v_traj = [], []
     all_pred_v0_traj, all_pred_vt_traj = [], []
     time_list = []
+    guidance_stats_all = []
     num_batch = int(np.ceil(num_samples / batch_size))
     current_i = 0
     for i in tqdm(range(num_batch)):
@@ -94,11 +97,18 @@ def sample_diffusion_ligand(model, data, num_samples, batch_size=16, device='cud
             center_pos_mode=center_pos_mode,
             guidance_model=guidance_model, # added guidance arg
             guidance_scale=guidance_scale, # added guidance arg
+            guidance_start_step=guidance_start_step,
+            guidance_log=guidance_log,
+            guidance_record_stats=guidance_return_stats,
+            guidance_scale_mode=guidance_scale_mode,
+            noise_scale=noise_scale,
         )
 
 
             ligand_pos, ligand_v, ligand_pos_traj, ligand_v_traj = r['pos'], r['v'], r['pos_traj'], r['v_traj']
             ligand_v0_traj, ligand_vt_traj = r['v0_traj'], r['vt_traj']
+            if guidance_return_stats and r.get('guidance_stats') is not None:
+                guidance_stats_all.extend(r['guidance_stats'])
             # unbatch pos
             ligand_cum_atoms = np.cumsum([0] + ligand_num_atoms)
             ligand_pos_array = ligand_pos.cpu().numpy().astype(np.float64)
@@ -129,7 +139,10 @@ def sample_diffusion_ligand(model, data, num_samples, batch_size=16, device='cud
         t2 = time.time()
         time_list.append(t2 - t1)
         current_i += n_data
-    return all_pred_pos, all_pred_v, all_pred_pos_traj, all_pred_v_traj, all_pred_v0_traj, all_pred_vt_traj, time_list
+    if guidance_return_stats:
+        return all_pred_pos, all_pred_v, all_pred_pos_traj, all_pred_v_traj, all_pred_v0_traj, all_pred_vt_traj, time_list, guidance_stats_all
+    else:
+        return all_pred_pos, all_pred_v, all_pred_pos_traj, all_pred_v_traj, all_pred_v0_traj, all_pred_vt_traj, time_list
 
 
 if __name__ == '__main__':
