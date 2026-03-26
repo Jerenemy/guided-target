@@ -131,6 +131,7 @@ if __name__ == '__main__':
     
     guidance_return_stats = getattr(config.sample, "guidance_log_stats", False)
     guidance_start_step = getattr(config.sample, "guidance_start_step", None)
+    guidance_end_step = getattr(config.sample, "guidance_end_step", None)
     guidance_log = guidance_return_stats or getattr(config.sample, "guidance_log", False)
     guidance_scale_mode = getattr(config.sample, "guidance_scale_mode", "var")
     noise_scale = getattr(config.sample, "noise_scale", 1.0)
@@ -145,6 +146,7 @@ if __name__ == '__main__':
         guidance_model=guidance_model,
         guidance_scale=getattr(config.sample, "guidance_scale", 0.0),
         guidance_start_step=guidance_start_step,
+        guidance_end_step=guidance_end_step,
         guidance_log=guidance_log,
         guidance_return_stats=guidance_return_stats,
         guidance_scale_mode=guidance_scale_mode,

@@ -651,6 +651,7 @@ class ScorePosNet3D(nn.Module):
         guidance_model=None, # guidance
         guidance_scale: float = 0.0, # guidance
         guidance_start_step=None,  # optional: only apply guidance when t <= this (int or fraction in (0,1))
+        guidance_end_step=None,  # optional: stop guidance when t < this (int or fraction in (0,1))
         guidance_log: bool = False,
         guidance_record_stats: bool = False,
         guidance_scale_mode: str = "var",  # 'var' (default, sigma^2), 'sigma', or 'fixed' (no sigma factor)
@@ -660,15 +661,27 @@ class ScorePosNet3D(nn.Module):
             num_steps = self.num_timesteps
         num_graphs = batch_protein.max().item() + 1
 
-        # interpret fractional start step
+        def resolve_guidance_step(step_value):
+            if step_value is None:
+                return None
+            if isinstance(step_value, numbers.Real) and 0 < step_value < 1:
+                return (self.num_timesteps - num_steps) + int(step_value * num_steps)
+            return int(step_value)
+
+        # interpret fractional guidance window bounds
         guidance_start_idx = None
-        if guidance_start_step is not None:
-            # allow ints or any real number
-            if isinstance(guidance_start_step, numbers.Real) and 0 < guidance_start_step < 1:
-                # fraction of the executed window [T-num_steps, T)
-                guidance_start_idx = (self.num_timesteps - num_steps) + int(guidance_start_step * num_steps)
-            else:
-                guidance_start_idx = int(guidance_start_step)
+        guidance_end_idx = None
+        guidance_start_idx = resolve_guidance_step(guidance_start_step)
+        guidance_end_idx = resolve_guidance_step(guidance_end_step)
+        if (
+            guidance_start_idx is not None
+            and guidance_end_idx is not None
+            and guidance_end_idx > guidance_start_idx
+        ):
+            raise ValueError(
+                f"guidance_end_step ({guidance_end_step}) resolves later than guidance_start_step "
+                f"({guidance_start_step}); expected a window like end <= t <= start."
+            )
 
         protein_pos, init_ligand_pos, offset = center_pos(
             protein_pos, init_ligand_pos, batch_protein, batch_ligand, mode=center_pos_mode)
@@ -717,7 +730,11 @@ class ScorePosNet3D(nn.Module):
             nonzero_mask = (1 - (t == 0).float())[batch_ligand].unsqueeze(-1)
 
             guidance_active = guidance_model is not None and guidance_scale > 0
-            if guidance_active and (guidance_start_idx is None or i <= guidance_start_idx):
+            within_guidance_window = (
+                (guidance_start_idx is None or i <= guidance_start_idx)
+                and (guidance_end_idx is None or i >= guidance_end_idx)
+            )
+            if guidance_active and within_guidance_window:
                 with torch.enable_grad():
                     lig_pos_leaf = ligand_pos.detach().clone().requires_grad_(True)
                     # scalar score per complex; e.g. -Vina_energy

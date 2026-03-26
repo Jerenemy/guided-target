@@ -31,7 +31,8 @@ def unbatch_v_traj(ligand_v_traj, n_data, ligand_cum_atoms):
 def sample_diffusion_ligand(model, data, num_samples, batch_size=16, device='cuda:0',
                             num_steps=None, pos_only=False, center_pos_mode='protein',
                             sample_num_atoms='prior', guidance_model=None, guidance_scale: float = 0.0,
-                            guidance_start_step=None, guidance_log: bool = False, guidance_return_stats: bool = False,
+                            guidance_start_step=None, guidance_end_step=None,
+                            guidance_log: bool = False, guidance_return_stats: bool = False,
                             guidance_scale_mode: str = "var", noise_scale: float = 1.0): # added guidance params
     all_pred_pos, all_pred_v = [], []
     all_pred_pos_traj, all_pred_v_traj = [], []
@@ -98,6 +99,7 @@ def sample_diffusion_ligand(model, data, num_samples, batch_size=16, device='cud
             guidance_model=guidance_model, # added guidance arg
             guidance_scale=guidance_scale, # added guidance arg
             guidance_start_step=guidance_start_step,
+            guidance_end_step=guidance_end_step,
             guidance_log=guidance_log,
             guidance_record_stats=guidance_return_stats,
             guidance_scale_mode=guidance_scale_mode,

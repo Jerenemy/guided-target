@@ -124,15 +124,18 @@ def load_guidance_wrapper(sample_obj, sample_cfg, guidance_ckpt, guidance_arch, 
     return wrapper, ligand_atom_mode, guidance_arch
 
 
-def batched_surrogate_scores(wrapper, pred_pos_list, pred_v_list, batch_size, device):
+def batched_surrogate_scores(wrapper, pred_pos_list, pred_v_list, protein_pos, batch_size, device):
     rows = []
+    protein_pos = protein_pos.to(device)
+    num_pocket_atoms = protein_pos.size(0)
     with torch.no_grad():
         for start in range(0, len(pred_pos_list), batch_size):
             pos_chunks = []
             v_chunks = []
             batch_chunks = []
+            protein_chunks = []
+            protein_batch_chunks = []
             graph_ids = []
-            atom_offset = 0
             stop = min(len(pred_pos_list), start + batch_size)
             for graph_idx, sample_idx in enumerate(range(start, stop)):
                 pos_np = pred_pos_list[sample_idx]
@@ -142,18 +145,23 @@ def batched_surrogate_scores(wrapper, pred_pos_list, pred_v_list, batch_size, de
                 pos_chunks.append(pos)
                 v_chunks.append(v)
                 batch_chunks.append(torch.full((pos.size(0),), graph_idx, dtype=torch.long, device=device))
+                protein_chunks.append(protein_pos)
+                protein_batch_chunks.append(
+                    torch.full((num_pocket_atoms,), graph_idx, dtype=torch.long, device=device)
+                )
                 graph_ids.append(sample_idx)
-                atom_offset += pos.size(0)
 
             ligand_pos = torch.cat(pos_chunks, dim=0)
             ligand_v = torch.cat(v_chunks, dim=0)
             batch_ligand = torch.cat(batch_chunks, dim=0)
+            protein_pos_batch = torch.cat(protein_chunks, dim=0)
+            batch_protein = torch.cat(protein_batch_chunks, dim=0)
             score = wrapper(
                 ligand_pos=ligand_pos,
                 ligand_v=ligand_v,
                 batch_ligand=batch_ligand,
-                batch_protein=None,
-                protein_pos=None,
+                batch_protein=batch_protein,
+                protein_pos=protein_pos_batch,
             )
             score = score.detach().cpu().numpy()
 
@@ -230,6 +238,7 @@ def main():
         wrapper=wrapper,
         pred_pos_list=sample_obj["pred_ligand_pos"],
         pred_v_list=sample_obj["pred_ligand_v"],
+        protein_pos=sample_obj["data"].protein_pos,
         batch_size=args.batch_size,
         device=args.device,
     )

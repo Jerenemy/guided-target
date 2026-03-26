@@ -3,7 +3,7 @@ model:
 
 sample:
   seed: 66
-  num_samples: 100
+  num_samples: 50
   num_steps: 1000
   pos_only: False
   center_pos_mode: protein
@@ -13,11 +13,16 @@ sample:
   guidance_arch: auto
   guidance_ligand_radius: 5.0
   guidance_cross_radius: 6.0
-  guidance_scale: 0.1
+  guidance_scale: 0.2
   # Only apply guidance when timestep <= guidance_start_step.
   # If set to a float in (0,1), treated as fraction of total steps.
   # Leave unset/null to apply at all steps (default).
   guidance_start_step: 0.1
+  # Optional lower timestep bound for guidance. Guidance is active only when
+  # guidance_end_step <= timestep <= guidance_start_step.
+  # Use this to stop guidance before the final cleanup steps, e.g. 0.02 for
+  # the last ~2% of a 1000-step run. Leave unset/null to guide down to t=0.
+  guidance_end_step: 0.02
   # How to scale guidance: 'var' (sigma^2 * grad), 'sigma' (sigma * grad), 'fixed' (grad only)
   guidance_scale_mode: sigma
   # Multiply diffusion noise by this factor (e.g., <1 to let guidance dominate)
